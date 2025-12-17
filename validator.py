@@ -216,8 +216,8 @@ def get_partner_lines(partner_id: int) -> List[str]:
     cur.execute("SELECT line FROM partner_lines WHERE partner_id = ?", (partner_id,))
     lines = [r[0] for r in cur.fetchall()]
     conn.close()
-    # do NOT sort if you ever want to preserve order; but for display order doesn't matter
-    return list(dict.fromkeys(lines))  # preserve insertion order, remove dups
+    # preserve insertion order, remove dups
+    return list(dict.fromkeys(lines))
 
 
 def get_partner_first_line(partner_id: int) -> Optional[str]:
@@ -319,6 +319,80 @@ def replace_master_lines(new_lines: List[str]):
     cur.execute("DELETE FROM master_lines")
     for ln in new_lines:
         cur.execute("INSERT OR IGNORE INTO master_lines(line) VALUES (?)", (ln,))
+    conn.commit()
+    conn.close()
+
+
+# ====== NEW: PARTNER EDIT HELPERS ======
+def rename_partner(old_name: str, new_name: str) -> bool:
+    """Rename a partner. Returns False if new_name already exists."""
+    conn = get_conn()
+    cur = conn.cursor()
+    new_name_clean = new_name.strip()
+    if not new_name_clean:
+        conn.close()
+        return False
+
+    # Check collision
+    cur.execute("SELECT id FROM partners WHERE name = ?", (new_name_clean,))
+    if cur.fetchone():
+        conn.close()
+        return False
+
+    cur.execute("UPDATE partners SET name = ? WHERE name = ?", (new_name_clean, old_name))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def update_partner_integration(name: str, integration_type: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE partners SET integration_type = ? WHERE name = ?",
+        (integration_type.strip(), name),
+    )
+    conn.commit()
+    conn.close()
+
+
+def append_partner_lines(name: str, lines: List[str]):
+    clean_lines = [ln.strip().lower() for ln in lines if ln.strip()]
+    if not clean_lines:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM partners WHERE name = ?", (name,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return
+    pid = row[0]
+    for ln in clean_lines:
+        cur.execute(
+            "INSERT INTO partner_lines(partner_id, line) VALUES (?, ?)", (pid, ln)
+        )
+        cur.execute("INSERT OR IGNORE INTO master_lines(line) VALUES (?)", (ln,))
+    conn.commit()
+    conn.close()
+
+
+def delete_partner_lines_by_values(name: str, lines: List[str]):
+    if not lines:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM partners WHERE name = ?", (name,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return
+    pid = row[0]
+    for ln in lines:
+        cur.execute(
+            "DELETE FROM partner_lines WHERE partner_id = ? AND line = ?",
+            (pid, ln),
+        )
     conn.commit()
     conn.close()
 
@@ -502,6 +576,7 @@ with col_info:
             )
 
     with st.expander("Demand Partners Manager", expanded=False):
+        # Delete partners
         del_select = st.multiselect(
             "Select partners to delete from DB",
             options=all_partner_names,
@@ -516,6 +591,115 @@ with col_info:
                     f"Deleted {len(del_select)} partner(s) from database. "
                     "They will disappear from lists on next run."
                 )
+
+        st.markdown("---")
+
+        # Edit a single partner
+        edit_partner = st.selectbox(
+            "Select partner to edit",
+            options=["(Select)"] + all_partner_names,
+            key="edit_partner_select",
+        )
+
+        if edit_partner != "(Select)":
+            pid, cur_integration = partner_name_map.get(edit_partner, (None, ""))
+            if pid is not None:
+                st.write(f"**Current Integration Type:** {cur_integration or 'Not set'}")
+
+                # Update integration type
+                new_it = st.selectbox(
+                    "New Integration Type",
+                    ["Prebid", "VAST", "Other"],
+                    index=["Prebid", "VAST", "Other"].index(
+                        (cur_integration or "Other")
+                        if (cur_integration or "Other") in ["Prebid", "VAST", "Other"]
+                        else "Other"
+                    ),
+                    key="edit_partner_integration_type",
+                )
+                if st.button("Update Integration Type", key="btn_update_integration"):
+                    update_partner_integration(edit_partner, new_it)
+                    st.success(
+                        f"Integration type updated to '{new_it}' "
+                        f"for partner '{edit_partner}'. (Refresh to see in IC.)"
+                    )
+
+                st.markdown("---")
+
+                # Existing lines
+                existing_lines = get_partner_lines(pid)
+                if existing_lines:
+                    st.caption("Existing ads.txt lines:")
+                    st.text_area(
+                        "Lines (read-only)",
+                        value="\n".join(existing_lines),
+                        height=150,
+                        key="existing_partner_lines_view",
+                    )
+                else:
+                    st.caption("This partner currently has no ads.txt lines in DB.")
+
+                # Add new lines
+                new_lines_text = st.text_area(
+                    "Add new ads.txt lines (will be appended)",
+                    key="partner_add_lines",
+                )
+                if st.button("Append New Lines", key="btn_append_lines"):
+                    new_lines_list = [
+                        ln for ln in new_lines_text.splitlines() if ln.strip()
+                    ]
+                    if not new_lines_list:
+                        st.warning("No lines entered.")
+                    else:
+                        append_partner_lines(edit_partner, new_lines_list)
+                        st.success(
+                            f"Appended {len(new_lines_list)} line(s) to partner '{edit_partner}'."
+                        )
+
+                st.markdown("---")
+
+                # Delete specific lines
+                if existing_lines:
+                    lines_to_delete = st.multiselect(
+                        "Select ads.txt lines to delete",
+                        options=existing_lines,
+                        key="partner_delete_lines",
+                    )
+                    if st.button("Delete Selected Lines", key="btn_delete_lines"):
+                        if not lines_to_delete:
+                            st.warning("No lines selected for deletion.")
+                        else:
+                            delete_partner_lines_by_values(edit_partner, lines_to_delete)
+                            st.success(
+                                f"Deleted {len(lines_to_delete)} line(s) "
+                                f"from partner '{edit_partner}'."
+                            )
+
+                st.markdown("---")
+
+                # Rename partner
+                new_partner_name = st.text_input(
+                    "Rename partner (new name)",
+                    key="rename_partner_input",
+                ).strip()
+                if st.button("Rename Partner", key="btn_rename_partner"):
+                    if not new_partner_name:
+                        st.warning("New partner name cannot be empty.")
+                    elif new_partner_name in all_partner_names:
+                        st.error(
+                            f"A partner with name '{new_partner_name}' already exists."
+                        )
+                    else:
+                        ok = rename_partner(edit_partner, new_partner_name)
+                        if ok:
+                            st.success(
+                                f"Partner '{edit_partner}' renamed to '{new_partner_name}'. "
+                                "Changes will appear in dropdowns on next refresh."
+                            )
+                        else:
+                            st.error(
+                                "Rename failed. It may be due to a name collision or DB issue."
+                            )
 
 # ---------- SIDEBAR: Manage Data ----------
 st.sidebar.header("Manage Data")
@@ -547,6 +731,40 @@ with st.sidebar.expander("➕ Add / Update Domain", expanded=False):
 
             add_domain(new_dom, am_to_use)
             st.sidebar.success(f"Domain '{new_dom}' saved successfully.")
+
+# Edit existing domain's Account Manager
+with st.sidebar.expander("✏️ Edit Domain", expanded=False):
+    edit_dom = st.selectbox(
+        "Select Domain",
+        options=["(Select)"] + all_domains,
+        key="edit_domain_select",
+    )
+    if edit_dom != "(Select)":
+        current_am = domain_am_map.get(edit_dom, "") or "(None)"
+        st.write(f"Current Account Manager: **{current_am}**")
+
+        existing_am2 = st.selectbox(
+            "Select existing Account Manager",
+            ["(None)"] + all_account_managers,
+            key="edit_existing_am_select",
+        )
+        new_am2 = st.text_input(
+            "Or add new Account Manager",
+            key="edit_new_am_input",
+        ).strip()
+
+        if st.button("Update Account Manager", key="btn_update_domain_am"):
+            if new_am2:
+                am_to_use2 = new_am2
+            elif existing_am2 != "(None)":
+                am_to_use2 = existing_am2
+            else:
+                am_to_use2 = ""
+
+            add_domain(edit_dom, am_to_use2)
+            st.success(
+                f"Account Manager for domain '{edit_dom}' updated to '{am_to_use2 or '(None)'}'."
+            )
 
 # Add Partner
 with st.sidebar.expander("➕ Add Demand Partner", expanded=False):
@@ -635,6 +853,13 @@ with col_left:
             final_domains = set(selected_domains)
             final_domains.update(pasted_domains)
 
+            # NEW: save pasted domains to DB if not already present (AM remains blank)
+            for d in pasted_domains:
+                if d and d not in all_domains:
+                    add_domain(d, "")
+                    all_domains.append(d)
+                    domain_am_map.setdefault(d, "")
+
             # If nothing selected/pasted, use all DB domains
             if not final_domains:
                 final_domains = set(all_domains)
@@ -721,6 +946,7 @@ with col_left:
                                     "Domain": dom,
                                     "Account Manager": domain_am_map.get(dom, ""),
                                     "Demand Partner": pname,
+                                    "Integration Type": itype or "",
                                     "Present Lines": len(domain_present),
                                     "Missing Lines": len(domain_missing),
                                     "First Line": summarize_first_line(
@@ -758,6 +984,7 @@ with col_left:
                                 "Domain": dom,
                                 "Account Manager": domain_am_map.get(dom, ""),
                                 "Demand Partner": "MASTER (All)",
+                                "Integration Type": "MASTER",
                                 "Present Lines": len(domain_present),
                                 "Missing Lines": len(domain_missing),
                                 "First Line": summarize_first_line(
