@@ -1009,7 +1009,7 @@ with col_left:
 
                     # Excel in-memory
                     output_excel = io.BytesIO()
-                    with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
+                    with pd.ExcelWriter(output_excel, engine="xlsxwriter") as writer:
                         df_summary.to_excel(
                             writer, index=False, sheet_name="Summary"
                         )
@@ -1080,3 +1080,4 @@ with col_left:
             "Select any combination of filters (or paste domains) and click "
             "**Validate ads.txt**."
         )
+
